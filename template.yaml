@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for tracking S3 object views using CloudTrail, EventBridge, and DynamoDB.'
+
+Resources:
+  # DynamoDB Table for Visit Count
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: VisitCounter
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # Lambda Function for Visit Counting
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateVisitCountFunction
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          dynamodb = boto3.client('dynamodb')
+          table_name = os.environ['TABLE_NAME']
+
+          def handler(event, context):
+              try:
+                  # Extract object details from the event
+                  s3_event = event.get("detail", {})
+                  bucket_name = s3_event.get("requestParameters", {}).get("bucketName")
+                  object_key = s3_event.get("requestParameters", {}).get("key")
+
+                  if not bucket_name or not object_key:
+                      raise ValueError("Invalid event format")
+
+                  visit_id = "visit_count"
+
+                  # Increment count atomically
+                  response = dynamodb.update_item(
+                      TableName=table_name,
+                      Key={"id": {"S": visit_id}},
+                      UpdateExpression="ADD #count :inc",
+                      ExpressionAttributeNames={"#count": "count"},
+                      ExpressionAttributeValues={":inc": {"N": "1"}},
+                      ReturnValues="UPDATED_NEW"
+                  )
+
+                  new_count = response["Attributes"]["count"]["N"]
+                  print(f"Updated visit count: {new_count}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Visit count updated successfully',
+                          'count': new_count
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'message': 'Error updating visit count', 'error': str(e)})
+                  }
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DynamoDBTable.Arn
+
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: srinath-cloudtrail-logs
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudTrail S3 Bucket Policy (Fixed)
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}"
+
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${CloudTrailBucket}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control  # Re-added ACL condition
+
+  # CloudTrail for S3 GetObject Events (Added Dependency)
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy  # Ensures bucket policy exists before CloudTrail uses it
+    Properties:
+      TrailName: S3ObjectAccessTrail
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: false
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: ReadOnly
+          IncludeManagementEvents: false
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub arn:aws:s3:::srinath-resume/*  # Added wildcard for correct tracking
+
+  # EventBridge Rule for S3 Object Get Events
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: S3GetObjectEventRule
+      Description: "Triggers Lambda when objects are accessed in S3"
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "s3.amazonaws.com"
+          eventName:
+            - "GetObject"
+          requestParameters:
+            bucketName:
+              - "srinath-resume"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "UpdateVisitCountLambda"
+
+  # EventBridge Permission for Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref LambdaFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref DynamoDBTable
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+
+  S3BucketName:
+    Description: S3 bucket name being monitored
+    Value: srinath-resume
